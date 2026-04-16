@@ -1,0 +1,262 @@
+name: "Dagger for GitHub"
+description: "Run dagger commands in Github Actions"
+inputs:
+  version:
+    description: "Dagger Version. Use semver vX.Y.Z or 'latest'"
+    required: false
+    default: "latest"
+  commit:
+    description: "Dagger Dev Commit"
+    required: false
+    default: ""
+  dagger-flags:
+    description: "Dagger CLI Flags"
+    required: false
+    default: "--progress plain"
+  verb:
+    description: "CLI verb (check, call, run, download, up, functions, shell, query)"
+    required: false
+    default: "call"
+  workdir:
+    description: "The working directory in which to run the Dagger CLI"
+    required: false
+    default: "."
+  cloud-token:
+    description: "Dagger Cloud Token"
+    required: false
+    default: ""
+  module:
+    description: "Dagger module to call. Local or Git"
+    required: false
+    default: ""
+  args:
+    description: "Arguments to pass to CLI"
+    required: false
+    default: ""
+  engine-stop:
+    description: "Deprecated"
+    deprecationMessage: "engine-stop is now a no-op and will be removed in a future release"
+    required: false
+  call:
+    description: "Function and arguments for dagger call"
+    required: false
+    default: ""
+  shell:
+    description: "Function and arguments for dagger shell"
+    required: false
+    default: ""
+  check:
+    description: "Function and arguments for dagger check"
+    required: false
+    default: ""
+  summary-path:
+    description: "File path to write the job summary"
+    required: false
+    default: ""
+  enable-github-summary:
+    description: "Whether to write summary to GITHUB_STEP_SUMMARY"
+    required: false
+    default: "false"
+outputs:
+  output:
+    description: "Job output"
+    value: ${{ steps.exec.outputs.stdout }}
+  traceURL:
+    description: "Dagger Cloud trace URL"
+    value: ${{ steps.exec.outputs.traceURL }}
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_COMMIT: ${{ inputs.commit }}
+      run: |
+        set -o pipefail
+        # Fallback to /usr/local for backwards compatability
+        prefix_dir="${RUNNER_TEMP:-/usr/local}"
+        # Ensure the dir is writable otherwise fallback to tmpdir
+        if [[ ! -d "$prefix_dir" ]] || [[ ! -w "$prefix_dir" ]]; then
+            prefix_dir="$(mktemp -d)"
+        fi
+        printf '%s/bin' "$prefix_dir" >> $GITHUB_PATH
+
+        # If the dagger version is 'latest', set the version back to an empty
+        # string. This allows the install script to detect and install the latest
+        # version itself
+        VERSION="$INPUT_VERSION"
+        if [[ "$VERSION" == "latest" ]]; then
+          VERSION=
+        elif [[ -n "$VERSION" && "$VERSION" != v* ]]; then
+          # Add 'v' prefix if version doesn't start with 'v' and is not empty
+          VERSION="v$VERSION"
+        fi
+
+        COMMIT="$INPUT_COMMIT"
+
+        if [[ -x "$(command -v dagger)" ]]; then
+          echo "::group::Checking dagger"
+          version="$(dagger --silent version | cut --fields 2 --delimiter ' ')"
+          echo "Found existing dagger version: $version"
+          if [[ -z "$VERSION" ]]; then
+            latest=$(curl -s https://dl.dagger.io/dagger/versions/latest)
+          fi
+          if [[ "$version" == "$VERSION" ]] || \
+             [[ -z "$VERSION" && "$version" == "$latest" ]]; then
+            echo "dagger ${version} is already installed, skipping installation"
+            exit 0
+          fi
+          echo "::endgroup::"
+        fi
+
+        echo "::group::Installing dagger"
+        install_script="$(mktemp)"
+        curl -fsSL https://dl.dagger.io/dagger/install.sh -o "$install_script"
+        BIN_DIR="${prefix_dir}/bin" DAGGER_VERSION="$VERSION" DAGGER_COMMIT="$COMMIT" sh "$install_script"
+        rm -f "$install_script"
+        echo "::endgroup::"
+
+    - id: should-exec
+      shell: bash
+      env:
+        INPUT_CALL: ${{ inputs.call }}
+        INPUT_SHELL: ${{ inputs.shell }}
+        INPUT_ARGS: ${{ inputs.args }}
+        INPUT_CHECK: ${{ inputs.check }}
+        INPUT_VERB: ${{ inputs.verb }}
+      run: |
+        # Determine if the user wants to execute a dagger command or just install
+        if [[ -n "$INPUT_CALL" ]] || \
+           [[ -n "$INPUT_SHELL" ]] || \
+           [[ -n "$INPUT_ARGS" ]] || \
+           [[ -n "$INPUT_CHECK" ]] || \
+           [[ "$INPUT_VERB" != "call" ]]; then
+          echo "result=true" >> "$GITHUB_OUTPUT"
+        fi
+    - id: assemble
+      if: steps.should-exec.outputs.result == 'true'
+      shell: bash
+      env:
+        INPUT_MODULE: ${{ inputs.module }}
+        INPUT_VERB: ${{ inputs.verb }}
+        INPUT_CALL: ${{ inputs.call }}
+        INPUT_SHELL_JSON: ${{ toJSON(inputs.shell) }}
+        INPUT_DAGGER_FLAGS_JSON: ${{ toJSON(inputs.dagger-flags) }}
+        INPUT_ARGS_JSON: ${{ toJSON(inputs.args) }}
+        INPUT_CALL_JSON: ${{ toJSON(inputs.call) }}
+        INPUT_CHECK_JSON: ${{ toJSON(inputs.check) }}
+      run: |
+        verb="$INPUT_VERB"
+        shell=$(printf '%s' "$INPUT_SHELL_JSON" | jq -rj .)
+        # Collapse backslash-continuations and newlines into spaces for CLI args
+        dagger_flags=$(printf '%s' "$INPUT_DAGGER_FLAGS_JSON" | jq -rj . | sed -z 's/\\\n/ /g; s/\n/ /g')
+        args=$(printf '%s' "$INPUT_ARGS_JSON" | jq -rj . | sed -z 's/\\\n/ /g; s/\n/ /g')
+        call=$(printf '%s' "$INPUT_CALL_JSON" | jq -rj . | sed -z 's/\\\n/ /g; s/\n/ /g')
+        check=$(printf '%s' "$INPUT_CHECK_JSON" | jq -rj . | sed -z 's/\\\n/ /g; s/\n/ /g')
+        if [[ -n "$INPUT_CALL" ]]; then
+          verb="call"
+        elif [[ -n "$check" ]]; then
+          verb="check"
+          # check input is used as a trigger; don't pass glob patterns as args
+          check=""
+        elif [[ "$shell" != "" ]]; then
+          verb=""
+          script=$(mktemp)
+          printf '%s' "$shell" > $script
+        fi
+        safe_script=$(printf '%s' "${script:-}" | tr -d '\n\r')
+        safe_verb=$(printf '%s' "$verb" | tr -d '\n\r')
+        safe_dagger_flags=$(printf '%s' "$dagger_flags" | tr -d '\n\r')
+        safe_args=$(printf '%s' "$args" | tr -d '\n\r')
+        safe_call=$(printf '%s' "$call" | tr -d '\n\r')
+        safe_check=$(printf '%s' "$check" | tr -d '\n\r')
+        echo "script=$safe_script" >> "$GITHUB_OUTPUT"
+        echo "verb=$safe_verb" >> "$GITHUB_OUTPUT"
+        echo "dagger-flags=$safe_dagger_flags" >> "$GITHUB_OUTPUT"
+        echo "args=$safe_args" >> "$GITHUB_OUTPUT"
+        echo "call=$safe_call" >> "$GITHUB_OUTPUT"
+        echo "check=$safe_check" >> "$GITHUB_OUTPUT"
+    - id: exec
+      if: steps.should-exec.outputs.result == 'true'
+      shell: bash
+      env:
+        INPUT_MODULE: ${{ inputs.module }}
+        VERB: ${{ steps.assemble.outputs.verb }}
+        SCRIPT: ${{ steps.assemble.outputs.script }}
+        DAGGER_FLAGS: ${{ steps.assemble.outputs.dagger-flags }}
+        EXTRA_ARGS: ${{ steps.assemble.outputs.args || steps.assemble.outputs.call || steps.assemble.outputs.script || steps.assemble.outputs.check }}
+        INPUT_WORKDIR: ${{ inputs.workdir }}
+        DAGGER_CLOUD_TOKEN: ${{ inputs.cloud-token }}
+        INPUT_SUMMARY_PATH: ${{ inputs.summary-path }}
+        INPUT_ENABLE_GITHUB_SUMMARY: ${{ inputs.enable-github-summary }}
+      run: |
+        tmpout=$(mktemp)
+        tmperr=$(mktemp)
+        cd "$INPUT_WORKDIR" && { \
+        dagger \
+        ${DAGGER_FLAGS} \
+        ${VERB} \
+        ${INPUT_MODULE:+-m $INPUT_MODULE} \
+        ${EXTRA_ARGS}; } 1> >(tee "${tmpout}") 2> >(tee "${tmperr}" >&2)
+        wait
+
+        {
+          # we need a delim that doesn't appear in the output - a hash of the
+          # file itself *probably* won't (if it does, we have larger
+          # cryptographic problems)
+          delim="$(sha256sum "$tmpout" | cut -d " " -f1)"
+          echo "stdout<<${delim}"
+          cat "${tmpout}"
+          echo
+          echo "${delim}"
+        } >> "$GITHUB_OUTPUT"
+
+        # Extract trace URL from stderr and set as traceURL output
+        trace_url=$((grep -Eo 'https://dagger.cloud(/[^ ]+/traces/[a-zA-Z0-9]+|/traces/setup)' "${tmperr}" || true) | head -n1)
+        if [[ -n "$trace_url" ]]; then
+          echo "traceURL=$trace_url" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Generate job summary content
+        summary_content(){
+          echo -e "## Command\n"
+          echo '```bash'
+          cmd="dagger $VERB $EXTRA_ARGS"
+          if [[ -n "$INPUT_MODULE" ]]; then
+            echo -e -E "DAGGER_MODULE=\"$INPUT_MODULE\" $cmd"
+          else
+            echo -e -E "$cmd"
+          fi
+          echo '```'
+          if [[ -n "$SCRIPT" ]]; then
+            echo -e "### Script\n"
+            echo '```bash'
+            cat "$SCRIPT"
+            echo -e "\n"
+            echo '```'
+          fi
+
+          echo -e "## Dagger trace\n"
+          if [[ -n "$trace_url" ]]; then
+            echo "[$trace_url]($trace_url)"
+          else
+            echo "No trace available. To setup: [https://dagger.cloud/traces/setup](https://dagger.cloud/traces/setup)"
+          fi
+
+          echo -e "## Dagger version\n"
+          echo '```bash'
+          dagger version || true
+          echo '```'
+
+          echo -e "---\n"
+        }
+
+        # Write to custom summary path if specified
+        if [[ -n "$INPUT_SUMMARY_PATH" ]]; then
+          summary_content > "$INPUT_SUMMARY_PATH"
+        fi
+
+        # Write to GitHub step summary if enabled (default: true)
+        if [[ "$INPUT_ENABLE_GITHUB_SUMMARY" == "true" ]]; then
+          summary_content > "${GITHUB_STEP_SUMMARY}"
+        fi
